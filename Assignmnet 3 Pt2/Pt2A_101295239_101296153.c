@@ -3,7 +3,6 @@
 #include <unistd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include <sys/sem.h>
 #include <sys/wait.h>
 #include <string.h>
 #include <time.h>
@@ -12,41 +11,19 @@
 #define NUM_QUESTIONS 5
 #define SHM_SIZE 1024
 
-// Union for semctl
-union semun {
-    int val;
-    struct semid_ds *buf;
-    unsigned short *array;
-};
-
 typedef struct {
     char rubric[NUM_QUESTIONS][100];
     int current_exam;
     int questions_marked[NUM_QUESTIONS];
     char exam_content[100];
-    int active_tas;
 } shared_data;
-
-// Semaphore indices
-#define RUBRIC_SEM 0    // Controls access to rubric modification
-#define EXAM_LOAD_SEM 1 // Controls loading next exam
-#define QUESTION_SEM 2  // Base for question semaphores
-
-void semaphore_wait(int semid, int sem_num) {
-    struct sembuf sb = {sem_num, -1, 0};
-    semop(semid, &sb, 1);
-}
-
-void semaphore_signal(int semid, int sem_num) {
-    struct sembuf sb = {sem_num, 1, 0};
-    semop(semid, &sb, 1);
-}
 
 void load_rubric(shared_data *data) {
     FILE *file = fopen("rubric.txt", "r");
     if (file) {
         for (int i = 0; i < NUM_QUESTIONS; i++) {
             fgets(data->rubric[i], 100, file);
+            // Remove newline if present
             data->rubric[i][strcspn(data->rubric[i], "\n")] = 0;
         }
         fclose(file);
@@ -64,6 +41,7 @@ void load_exam(shared_data *data, int exam_num) {
         fclose(file);
     }
     
+    // Reset marked questions
     for (int i = 0; i < NUM_QUESTIONS; i++) {
         data->questions_marked[i] = 0;
     }
@@ -71,49 +49,44 @@ void load_exam(shared_data *data, int exam_num) {
     data->current_exam = exam_num;
 }
 
-void ta_process(int ta_id, shared_data *data, int semid, int num_tas) {
+void ta_process(int ta_id, shared_data *data, int num_tas) {
     printf("TA %d started marking\n", ta_id);
     
     while (1) {
-        // Check termination condition
-        semaphore_wait(semid, EXAM_LOAD_SEM);
+        // Check if we've reached the end
         if (data->current_exam > MAX_EXAMS) {
-            semaphore_signal(semid, EXAM_LOAD_SEM);
             printf("TA %d: No more exams to mark\n", ta_id);
             break;
         }
         
+        // Load current exam info
         int current_exam = data->current_exam;
-        char current_student[100];
-        strcpy(current_student, data->exam_content);
-        semaphore_signal(semid, EXAM_LOAD_SEM);
+        printf("TA %d: Working on exam %d (%s)\n", ta_id, current_exam, data->exam_content);
         
-        // Check for termination exam
-        if (strstr(current_student, "9999") != NULL) {
-            semaphore_wait(semid, EXAM_LOAD_SEM);
-            data->current_exam = MAX_EXAMS + 1;
-            semaphore_signal(semid, EXAM_LOAD_SEM);
+        // Check if this is the termination exam
+        if (strstr(data->exam_content, "9999") != NULL) {
             printf("TA %d: Reached termination exam, stopping\n", ta_id);
+            data->current_exam = MAX_EXAMS + 1; // Signal other TAs to stop
             break;
         }
-        
-        printf("TA %d: Working on exam %d (%s)\n", ta_id, current_exam, current_student);
         
         // Review and potentially correct rubric
         printf("TA %d: Reviewing rubric\n", ta_id);
         for (int i = 0; i < NUM_QUESTIONS; i++) {
+            // Random delay 0.5-1.0 seconds
             usleep(500000 + (rand() % 500000));
             
+            // Random decision to correct (20% chance)
             if (rand() % 5 == 0) {
-                // Acquire rubric semaphore for modification
-                semaphore_wait(semid, RUBRIC_SEM);
                 printf("TA %d: Correcting rubric for question %d\n", ta_id, i+1);
                 
+                // Find the comma and modify the character after it
                 char *comma = strchr(data->rubric[i], ',');
-                if (comma && *(comma+2) != 0) {
-                    *(comma+2) = *(comma+2) + 1;
+                if (comma && *(comma+2) != 0) { // +2 to skip comma and space
+                    *(comma+2) = *(comma+2) + 1; // Next ASCII character
                     printf("TA %d: Updated rubric: %s\n", ta_id, data->rubric[i]);
                     
+                    // Save to file
                     FILE *rubric_file = fopen("rubric.txt", "w");
                     if (rubric_file) {
                         for (int j = 0; j < NUM_QUESTIONS; j++) {
@@ -122,7 +95,6 @@ void ta_process(int ta_id, shared_data *data, int semid, int num_tas) {
                         fclose(rubric_file);
                     }
                 }
-                semaphore_signal(semid, RUBRIC_SEM);
             }
         }
         
@@ -131,50 +103,39 @@ void ta_process(int ta_id, shared_data *data, int semid, int num_tas) {
         int questions_marked = 0;
         
         while (questions_marked < NUM_QUESTIONS) {
+            // Find an unmarked question
             int question_to_mark = -1;
-            
-            // Find an unmarked question (with synchronization)
             for (int i = 0; i < NUM_QUESTIONS; i++) {
-                semaphore_wait(semid, QUESTION_SEM + i);
                 if (data->questions_marked[i] == 0) {
-                    data->questions_marked[i] = ta_id + 1; // Mark as being marked by this TA
                     question_to_mark = i;
-                    semaphore_signal(semid, QUESTION_SEM + i);
                     break;
                 }
-                semaphore_signal(semid, QUESTION_SEM + i);
             }
             
             if (question_to_mark == -1) {
-                break; // All questions marked or being marked
+                break; // All questions marked
             }
             
+            // Mark the question (1.0-2.0 seconds)
             printf("TA %d: Marking question %d for exam %d\n", ta_id, question_to_mark+1, current_exam);
             usleep(1000000 + (rand() % 1000000));
             
-            printf("TA %d: Marked question %d for student %s\n", ta_id, question_to_mark+1, current_student);
+            data->questions_marked[question_to_mark] = 1;
             questions_marked++;
+            
+            printf("TA %d: Marked question %d for student %s\n", ta_id, question_to_mark+1, data->exam_content);
         }
         
-        // Check if all questions are marked and load next exam
-        semaphore_wait(semid, EXAM_LOAD_SEM);
-        int all_marked = 1;
-        for (int i = 0; i < NUM_QUESTIONS; i++) {
-            if (data->questions_marked[i] == 0) {
-                all_marked = 0;
-                break;
-            }
-        }
-        
-        if (all_marked && data->current_exam == current_exam) {
+        // Move to next exam
+        if (ta_id == 0) { // Let TA 0 handle loading next exam
             data->current_exam++;
             if (data->current_exam <= MAX_EXAMS) {
                 load_exam(data, data->current_exam);
                 printf("TA %d: Loaded next exam %d\n", ta_id, data->current_exam);
             }
         }
-        semaphore_signal(semid, EXAM_LOAD_SEM);
         
+        // Small delay before next iteration
         usleep(100000);
     }
     
@@ -200,25 +161,8 @@ int main(int argc, char *argv[]) {
     int shmid = shmget(key, sizeof(shared_data), 0666|IPC_CREAT);
     shared_data *data = (shared_data*) shmat(shmid, NULL, 0);
     
-    // Create semaphores
-    int semid = semget(key, NUM_QUESTIONS + 3, 0666|IPC_CREAT);
-    
-    // Initialize semaphores
-    union semun arg;
-    unsigned short values[NUM_QUESTIONS + 3];
-    
-    values[RUBRIC_SEM] = 1;    // Binary semaphore for rubric access
-    values[EXAM_LOAD_SEM] = 1; // Binary semaphore for exam loading
-    for (int i = 0; i < NUM_QUESTIONS; i++) {
-        values[QUESTION_SEM + i] = 1; // Binary semaphores for each question
-    }
-    
-    arg.array = values;
-    semctl(semid, 0, SETALL, arg);
-    
     // Initialize shared data
     data->current_exam = 1;
-    data->active_tas = num_tas;
     load_rubric(data);
     load_exam(data, 1);
     
@@ -231,7 +175,8 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < num_tas; i++) {
         pid_t pid = fork();
         if (pid == 0) {
-            ta_process(i, data, semid, num_tas);
+            // Child process (TA)
+            ta_process(i, data, num_tas);
             exit(0);
         } else if (pid < 0) {
             printf("Failed to create process for TA %d\n", i);
@@ -243,10 +188,9 @@ int main(int argc, char *argv[]) {
         wait(NULL);
     }
     
-    // Cleanup
+    // Cleanup shared memory
     shmdt(data);
     shmctl(shmid, IPC_RMID, NULL);
-    semctl(semid, 0, IPC_RMID);
     
     printf("All TAs finished marking\n");
     return 0;
